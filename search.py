@@ -429,8 +429,101 @@ with main_tabs[0]:
 # --- TAB 2: Search Products ---
 with main_tabs[1]:
     st.header("2. Search Products")
-    # ... existing search products code ...
-    pass
+    db = client[mongo_db_name]
+    collection = db[mongo_collection_name]
+    sample_doc = collection.find_one()
+    if sample_doc:
+        default_fields = [k for k in sample_doc.keys() if k not in ["_id", "embedding", "_session", "row", "score"]]
+    else:
+        default_fields = []
+    # --- Dynamic Filters ---
+    filter_dict = {}
+    st.subheader("Filters")
+    if sample_doc:
+        for field in default_fields:
+            val = sample_doc[field]
+            if isinstance(val, (int, float, np.integer, np.floating)):
+                min_val = st.number_input(f"{field} min", value=None, step=1.0, format="%.2f")
+                max_val = st.number_input(f"{field} max", value=None, step=1.0, format="%.2f")
+                if min_val is not None:
+                    filter_dict[field] = filter_dict.get(field, {})
+                    filter_dict[field]["$gte"] = min_val
+                if max_val is not None:
+                    filter_dict[field] = filter_dict.get(field, {})
+                    filter_dict[field]["$lte"] = max_val
+                if field in filter_dict and not filter_dict[field]:
+                    filter_dict.pop(field)
+            elif isinstance(val, bool):
+                bool_val = st.selectbox(f"{field}", options=["(geen filter)", True, False], index=0)
+                if bool_val != "(geen filter)":
+                    filter_dict[field] = bool_val
+            elif isinstance(val, str):
+                text_filter = st.text_input(f"{field} bevat", value="")
+                if text_filter:
+                    filter_dict[field] = {"$regex": text_filter, "$options": "i"}
+    text_fields = st.multiselect(
+        "Velden om te tonen in zoekresultaten",
+        options=default_fields,
+        default=default_fields[:2] if len(default_fields) >= 2 else default_fields,
+        help="Kies welke velden je wilt zien in de zoekresultaten."
+    )
+    query = st.text_input("Voer je zoekopdracht in")
+    k = st.slider("Aantal resultaten", min_value=1, max_value=10, value=5)
+    if not sample_doc:
+        st.info("Geen documenten gevonden in MongoDB. Upload en indexeer eerst een CSV.")
+    elif query:
+        st.info(f"Zoekt met model: `{OPENAI_EMBEDDING_MODEL}`")
+        with st.spinner("Query embedden en zoeken in MongoDB..."):
+            openai.api_key = openai_api_key
+            response = openai.embeddings.create(
+                input=[query],
+                model=OPENAI_EMBEDDING_MODEL
+            )
+            query_vec = response.data[0].embedding
+            # Always filter on _session if present in sample_doc
+            session_filter = {}
+            if "_session" in sample_doc:
+                session_filter["_session"] = sample_doc["_session"]
+            # Merge with UI filters
+            mongo_filter = {**session_filter, **filter_dict}
+            pipeline = [
+                {"$vectorSearch": {
+                    "index": "vector_index",
+                    "path": "embedding",
+                    "queryVector": query_vec,
+                    "numCandidates": max(100, k*20),
+                    "limit": k,
+                    "filter": mongo_filter if mongo_filter else None
+                }},
+                {"$project": {
+                    "_id": 0,
+                    "row": 1,
+                    "score": {"$meta": "vectorSearchScore"},
+                    **{col: 1 for col in default_fields}
+                }}
+            ]
+            # Remove None filter if empty
+            if pipeline[0]["$vectorSearch"]["filter"] is None:
+                del pipeline[0]["$vectorSearch"]["filter"]
+            results = list(collection.aggregate(pipeline))
+            st.subheader("Top matches:")
+            if not results:
+                st.warning("Geen resultaten gevonden.")
+            for rank, item in enumerate(results):
+                score = item.get("score", 0)
+                with st.container():
+                    cols = st.columns([1, 2, 6])
+                    if 'sku' in item:
+                        cols[0].write(f"SKU: {item['sku']}")
+                    if 'image' in item:
+                        cols[1].image(item['image'], width=100)
+                    for col in text_fields:
+                        if col in item:
+                            cols[2].write(f"{col.capitalize()}: {item[col]}")
+                    cols[2].markdown(f"**Score:** `{score:.3f}`")
+                    with st.expander("Toon raw document"):
+                        st.json(item)
+                st.markdown("---")
 
 # --- TAB 3: Search Orders (disabled/coming soon) ---
 with main_tabs[2]:
