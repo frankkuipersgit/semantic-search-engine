@@ -220,63 +220,45 @@ if uploaded_file:
                     for future in as_completed(future_to_idx):
                         idx = future_to_idx[future]
                         try:
-                            responses[idx] = future.result()
+                            response = future.result()
+                            docs_to_upload = []
+                            start_idx = sum(len(b) for b in batches[:idx])
+                            for j, emb in enumerate(response.data):
+                                doc_idx = start_idx + j
+                                doc = {
+                                    "_session": cache_hash,
+                                    "row": doc_idx,
+                                    "text": str(docs[doc_idx])[:2000],
+                                    "embedding": emb.embedding,
+                                }
+                                for col in df.columns:
+                                    val = df.iloc[doc_idx][col]
+                                    if hasattr(val, 'item'):
+                                        try:
+                                            val = val.item()
+                                        except Exception:
+                                            val = str(val)
+                                    else:
+                                        val = str(val)
+                                    if isinstance(val, str):
+                                        val = val[:2000]
+                                    doc[col] = val
+                                if image_col != "(geen)":
+                                    doc["image"] = str(df.iloc[doc_idx][image_col])
+                                docs_to_upload.append(doc)
+                            if docs_to_upload:
+                                collection.insert_many(docs_to_upload)
                         except Exception as e:
                             st.error(f"Fout bij batch {idx+1}: {e}")
                         done_batches += 1
                         progress = done_batches / total_batches
                         progress_bar.progress(progress)
-                        status_placeholder.markdown(f"**Batch {done_batches} van {total_batches} verwerkt**")
-                        st.toast(f"Batch {done_batches} van {total_batches} verwerkt")
+                        status_placeholder.markdown(f"**Batch {done_batches} van {total_batches} (geüpload)**")
+                        st.toast(f"Batch {done_batches} van {total_batches} (geüpload)")
                 progress_bar.empty()
                 status_placeholder.empty()
 
-                # Verzamel en upload alle embeddings naar MongoDB
-                doc_idx = 0
-                for batch_idx, response in enumerate(responses):
-                    if response is None:
-                        continue
-                    for j, emb in enumerate(response.data):
-                        all_embeddings.append(emb.embedding)
-                        doc = {
-                            "_session": cache_hash,
-                            "row": doc_idx,
-                            # Truncate text to 2000 chars and ensure string type
-                            "text": str(docs[doc_idx])[:2000],
-                            "embedding": emb.embedding,
-                            # Add all original fields for reference
-                        }
-                        for col in df.columns:
-                            val = df.iloc[doc_idx][col]
-                            # Convert numpy scalars to native Python types
-                            if hasattr(val, 'item'):
-                                try:
-                                    val = val.item()
-                                except Exception:
-                                    val = str(val)
-                            else:
-                                val = str(val)
-                            # Truncate if string
-                            if isinstance(val, str):
-                                val = val[:2000]
-                            doc[col] = val
-                        # Save image column if selected
-                        if image_col != "(geen)":
-                            doc["image"] = str(df.iloc[doc_idx][image_col])
-                        # Only insert if SKU+_session does not exist
-                        sku_val = doc.get('sku', None)
-                        if sku_val is not None:
-                            exists = collection.count_documents({"_session": cache_hash, "sku": sku_val}, limit=1)
-                            if exists == 0:
-                                collection.insert_one(doc)
-                        else:
-                            # If no SKU, fallback to row+_session
-                            exists = collection.count_documents({"_session": cache_hash, "row": doc["row"]}, limit=1)
-                            if exists == 0:
-                                collection.insert_one(doc)
-                        doc_idx += 1
                 st.toast("All embeddings created and uploaded to MongoDB!")
-                st.session_state.embeddings = np.array(all_embeddings, dtype=np.float32)
                 st.session_state.index = None
                 st.session_state.model = None
                 st.session_state.built_for = {'df_hash': df_hash, 'fields': fields_hash, 'batch_size': batch_size, 'backend': backend}
