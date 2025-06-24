@@ -1,0 +1,11 @@
+streamlit
+pandas
+faiss-cpu
+sentence-transformers
+numpy
+torch
+requests
+pymongo
+openai
+python-dotenv
+tiktoken 
