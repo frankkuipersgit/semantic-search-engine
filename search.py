@@ -14,6 +14,7 @@ import openai
 import tiktoken
 import dotenv
 from datetime import datetime
+from pymongo import UpdateOne
 
 dotenv.load_dotenv()
 
@@ -41,8 +42,7 @@ else:
     DEVICE = "cpu"
     device_label = "CPU"
 
-st.title("🔎 Semantic Search Engine (Dutch & Multilingual)")
-st.write(f"**Embedding device:** {device_label}")
+# --- (Moved UI title and device label below, inside tab logic) ---
 
 # Backend selector
 backend = "MongoDB + OpenAI"
@@ -268,149 +268,27 @@ if uploaded_file:
             st.success("Embeddings created and uploaded to MongoDB! Ready to search. (Metadata saved)")
             st.session_state.building = False
 
-        # Search UI
-        query = st.text_input("Enter your search query")
-        k = st.slider("Number of results", min_value=1, max_value=10, value=5)
-        if not cache_loaded:
-            st.info("Please build embeddings before searching.")
-        elif query:
-            with st.spinner("Embedding query and searching MongoDB..."):
-                openai.api_key = openai_api_key
-                client = pymongo.MongoClient(mongo_uri)
-                db = client[mongo_db_name]
-                collection = db[mongo_collection_name]
-                # Embed the query
-                response = openai.embeddings.create(
-                    input=[query],
-                    model=OPENAI_EMBEDDING_MODEL
-                )
-                query_vec = response.data[0].embedding
-                # Run $vectorSearch aggregation
-                pipeline = [
-                    {"$vectorSearch": {
-                        "index": "vector_index",  # You must create this index in Atlas UI
-                        "path": "embedding",
-                        "queryVector": query_vec,
-                        "numCandidates": max(100, k*20),
-                        "limit": k,
-                        "filter": {"_session": cache_hash}
-                    }},
-                    {"$project": {
-                        "_id": 0,
-                        "row": 1,
-                        "score": {"$meta": "vectorSearchScore"},
-                        **{col: 1 for col in df.columns}
-                    }}
-                ]
-                results = list(collection.aggregate(pipeline))
-                st.subheader("Top matches:")
-                for rank, item in enumerate(results):
-                    idx = item.get("row", None)
-                    score = item.get("score", 0)
-                    cols = st.columns([1, 2, 6])
-                    if 'sku' in item:
-                        cols[0].write(f"SKU: {item['sku']}")
-                    if 'image' in item:
-                        cols[1].image(item['image'], width=100)
-                    for col in text_fields:
-                        if col in item:
-                            cols[2].write(f"{col.capitalize()}: {item[col]}")
-                    st.write(f"Score: {score:.3f}")
-                    st.write("---")
-    else:
-        st.warning("Please select at least one field to search through.")
-else:
-    if backend == "MongoDB + OpenAI":
-        # Try to fetch a sample document to infer fields
-        openai.api_key = openai_api_key
-        client = pymongo.MongoClient(mongo_uri)
-        db = client[mongo_db_name]
-        collection = db[mongo_collection_name]
-        sample_doc = collection.find_one()
-        if sample_doc:
-            # Exclude internal fields
-            default_fields = [k for k in sample_doc.keys() if k not in ["_id", "embedding", "_session", "row", "score"]]
-        else:
-            default_fields = []
-        text_fields = st.multiselect(
-            "Select fields to display in results",
-            options=default_fields,
-            default=default_fields[:2] if len(default_fields) >= 2 else default_fields
-        )
-        query = st.text_input("Enter your search query")
-        k = st.slider("Number of results", min_value=1, max_value=10, value=5)
-        if not sample_doc:
-            st.info("No documents found in MongoDB. Please upload a CSV and build embeddings first.")
-        elif query:
-            with st.spinner("Embedding query and searching MongoDB..."):
-                response = openai.embeddings.create(
-                    input=[query],
-                    model=OPENAI_EMBEDDING_MODEL
-                )
-                query_vec = response.data[0].embedding
-                pipeline = [
-                    {"$vectorSearch": {
-                        "index": "vector_index",  # Use correct index name
-                        "path": "embedding",
-                        "queryVector": query_vec,
-                        "numCandidates": max(100, k*20),
-                        "limit": k
-                    }},
-                    {"$project": {
-                        "_id": 0,
-                        "row": 1,
-                        "score": {"$meta": "vectorSearchScore"},
-                        **{col: 1 for col in default_fields}
-                    }}
-                ]
-                results = list(collection.aggregate(pipeline))
-                st.subheader("Top matches:")
-                for rank, item in enumerate(results):
-                    idx = item.get("row", None)
-                    score = item.get("score", 0)
-                    cols = st.columns([1, 2, 6])
-                    if 'sku' in item:
-                        cols[0].write(f"SKU: {item['sku']}")
-                    if 'image' in item:
-                        cols[1].image(item['image'], width=100)
-                    for col in text_fields:
-                        if col in item:
-                            cols[2].write(f"{col.capitalize()}: {item[col]}")
-                    st.write(f"Score: {score:.3f}")
-                    st.write("---")
-    else:
-        st.info("Please upload a CSV file to get started.")
+# Ensure MongoDB client is defined for all tabs
+client = pymongo.MongoClient(mongo_uri)
 
-# MongoDB connection status
-try:
-    client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=2000)
-    client.server_info()
-    mongo_status = "🟢 Verbonden"
-    db = client[mongo_db_name]
-    collection = db[mongo_collection_name]
-    doc_count = collection.count_documents({})
-    st.sidebar.markdown(f"**DB:** `{mongo_db_name}`  ")
-    st.sidebar.markdown(f"**Collectie:** `{mongo_collection_name}`  ")
-    st.sidebar.markdown(f"**Docs:** `{doc_count}`  ")
-except Exception as e:
-    mongo_status = f"🔴 Niet verbonden: {e}"
-    st.sidebar.markdown(f"**DB:** `{mongo_db_name}`  ")
-    st.sidebar.markdown(f"**Collectie:** `{mongo_collection_name}`  ")
-    st.sidebar.markdown(f"**Docs:** `?`  ")
-st.sidebar.markdown(f"**MongoDB status:** {mongo_status}")
-st.sidebar.markdown(f"**Model:** `{OPENAI_EMBEDDING_MODEL}`")
+# Sidebar navigation
+sidebar_tabs = [
+    "Search Products",
+    "Search Orders",
+    "Categorize Products",
+    "Dataset Info",
+    "Upload & Index"
+]
+selected_tab = st.sidebar.radio("Navigatie", sidebar_tabs, index=0)
 
-# Tabs for workflow
-main_tabs = st.tabs(["Upload & Index", "Search Products", "Search Orders", "Categorize Products", "Dataset Info"])
-
-# --- TAB 1: Upload & Index ---
-with main_tabs[0]:
-    # ... existing upload & index code ...
+# --- MAIN AREA ---
+if selected_tab == "Upload & Index":
+    st.header("Upload & Indexeer je CSV")
     pass
-
-# --- TAB 2: Search Products ---
-with main_tabs[1]:
-    st.header("2. Search Products")
+elif selected_tab == "Search Products":
+    st.title("🔎 Semantic Search Engine (Dutch & Multilingual)")
+    st.write(f"**Embedding device:** {device_label}")
+    st.header("Search Products")
     db = client[mongo_db_name]
     collection = db[mongo_collection_name]
     sample_doc = collection.find_one()
@@ -506,20 +384,150 @@ with main_tabs[1]:
                     with st.expander("Toon raw document"):
                         st.json(item)
                 st.markdown("---")
-
-# --- TAB 3: Search Orders (disabled/coming soon) ---
-with main_tabs[2]:
-    st.header("3. Search Orders")
+elif selected_tab == "Search Orders":
+    st.header("Search Orders")
     st.info("Deze functionaliteit komt binnenkort beschikbaar.")
     st.markdown("<div style='color:gray;'>[Gedisabled]</div>", unsafe_allow_html=True)
+elif selected_tab == "Categorize Products":
+    st.header("Categorize Products")
+    db = client[mongo_db_name]
+    collection = db[mongo_collection_name]
+    cat_collection = db["categories"]
 
-# --- TAB 4: Categorize Products (disabled/coming soon) ---
-with main_tabs[3]:
-    st.header("4. Categorize Products")
-    st.info("Deze functionaliteit komt binnenkort beschikbaar.")
-    st.markdown("<div style='color:gray;'>[Gedisabled]</div>", unsafe_allow_html=True)
+    # Editable table for categories
+    st.subheader("Stap 1: Voeg categorieën toe of bewerk ze")
+    existing_cats = list(cat_collection.find({}, {"_id": 0, "category": 1}))
+    cat_df = pd.DataFrame(existing_cats) if existing_cats else pd.DataFrame({"category": [""]})
+    cat_df = st.data_editor(cat_df, num_rows="dynamic", key="cat_editor")
+    if st.button("Sla categorieën op"):
+        categories_to_save = [row["category"] for _, row in cat_df.iterrows() if row["category"].strip()]
+        if not categories_to_save:
+            st.warning("Geen categorieën om op te slaan.")
+        else:
+            with st.spinner("Categorieën embedden en opslaan..."):
+                openai.api_key = openai_api_key
+                try:
+                    cat_embeddings_response = openai.embeddings.create(
+                        input=categories_to_save,
+                        model=OPENAI_EMBEDDING_MODEL
+                    )
+                    docs_to_insert = []
+                    for i, category_name in enumerate(categories_to_save):
+                        docs_to_insert.append({
+                            "category": category_name,
+                            "embedding": cat_embeddings_response.data[i].embedding
+                        })
+                    cat_collection.delete_many({})
+                    if docs_to_insert:
+                        cat_collection.insert_many(docs_to_insert)
+                    st.success(f"{len(docs_to_insert)} categorieën opgeslagen met embeddings!")
+                except Exception as e:
+                    st.error(f"Fout bij het embedden van categorieën: {e}")
 
-# --- TAB 5: Dataset Info ---
-with main_tabs[4]:
-    st.header("5. Dataset Info & Statistieken")
+    # Categorize products
+    st.subheader("Stap 2: Categoriseer producten met AI")
+    if st.button("Categoriseer producten"):
+        categories_with_embeddings = list(cat_collection.find({}, {"_id": 0, "category": 1, "embedding": 1}))
+        if not categories_with_embeddings:
+            st.warning("Voeg eerst categorieën toe en sla ze op.")
+        else:
+            categories = [c["category"] for c in categories_with_embeddings]
+            cat_vecs = np.array([c["embedding"] for c in categories_with_embeddings], dtype=np.float32)
+            
+            openai.api_key = openai_api_key
+            
+            total_products = collection.count_documents({})
+            if total_products == 0:
+                st.warning("Geen producten gevonden om te categoriseren. Indexeer eerst een CSV.")
+                st.stop()
+
+            # --- Process products in chunks for performance and memory efficiency ---
+            chunk_size = 500 
+            product_cursor = collection.find({})
+            
+            all_processed_products = []
+            display_columns = None
+            progress_bar = st.progress(0)
+            table_placeholder = st.empty()
+            
+            st.toast(f"Categorizing {total_products} products in chunks of {chunk_size}...")
+
+            product_chunk = []
+            processed_count = 0
+            
+            for i, product in enumerate(product_cursor):
+                product_chunk.append(product)
+                
+                # Process the chunk when it's full or it's the last product
+                if len(product_chunk) == chunk_size or (i + 1) == total_products:
+                    # 1. Vector similarity calculation for the chunk
+                    if "embedding" not in product_chunk[0]:
+                        st.error("Products are missing embeddings. Please re-index the data.")
+                        st.stop()
+                    prod_vecs = np.array([p["embedding"] for p in product_chunk], dtype=np.float32)
+                    sim = np.dot(prod_vecs, cat_vecs.T)
+                    best_cat_idx = np.argmax(sim, axis=1)
+                    best_cat_score = np.max(sim, axis=1)
+
+                    # 2. Assign categories and prepare bulk update
+                    update_operations = []
+                    for j, p_item in enumerate(product_chunk):
+                        p_item["assigned_category"] = categories[best_cat_idx[j]]
+                        p_item["category_score"] = float(best_cat_score[j])
+                        update_operations.append(
+                            UpdateOne({"_id": p_item["_id"]}, {"$set": {
+                                "assigned_category": p_item["assigned_category"], 
+                                "category_score": p_item["category_score"]
+                            }})
+                        )
+                    
+                    if update_operations:
+                        collection.bulk_write(update_operations)
+
+                    # 3. Update UI
+                    all_processed_products.extend(product_chunk)
+                    
+                    if display_columns is None:
+                        # Determine columns on first run and set a user-friendly order
+                        preferred_order = ["sku", "text", "assigned_category", "category_score"]
+                        all_keys = list(all_processed_products[0].keys())
+                        other_cols = sorted([k for k in all_keys if k not in preferred_order and k not in ["_id", "embedding", "row", "_session"]])
+                        display_columns = [col for col in preferred_order if col in all_keys] + other_cols
+
+                    df_stream = pd.DataFrame(all_processed_products)
+                    df_stream['category_score'] = df_stream['category_score'].apply(lambda x: f'{x:.4f}')
+                    table_placeholder.dataframe(df_stream.iloc[::-1][display_columns])
+                    
+                    # 4. Reset chunk and update progress
+                    processed_count += len(product_chunk)
+                    product_chunk = []
+                    progress_bar.progress(processed_count / total_products)
+
+            product_cursor.close()
+            st.toast("Categorization complete!")
+            progress_bar.empty()
+
+    st.info("Voeg eerst categorieën toe, klik dan op 'Categoriseer producten'. Je kunt het resultaat downloaden als CSV.")
+elif selected_tab == "Dataset Info":
+    st.header("Dataset Info & Statistieken")
     pass
+
+# --- SIDEBAR DB INFO ---
+with st.sidebar.expander("📦 Database Info & Config", expanded=True):
+    try:
+        client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=2000)
+        client.server_info()
+        mongo_status = "🟢 Verbonden"
+        db = client[mongo_db_name]
+        collection = db[mongo_collection_name]
+        doc_count = collection.count_documents({})
+        st.markdown(f"**DB:** `{mongo_db_name}`  ")
+        st.markdown(f"**Collectie:** `{mongo_collection_name}`  ")
+        st.markdown(f"**Docs:** `{doc_count}`  ")
+    except Exception as e:
+        mongo_status = f"🔴 Niet verbonden: {e}"
+        st.markdown(f"**DB:** `{mongo_db_name}`  ")
+        st.markdown(f"**Collectie:** `{mongo_collection_name}`  ")
+        st.markdown(f"**Docs:** `?`  ")
+    st.markdown(f"**MongoDB status:** {mongo_status}")
+    st.markdown(f"**Model:** `{OPENAI_EMBEDDING_MODEL}`")
