@@ -64,9 +64,11 @@ if st.sidebar.button("Leeg database (MongoDB)"):
     if confirm_clear:
         client = pymongo.MongoClient(mongo_uri)
         db = client[mongo_db_name]
-        collection = db[mongo_collection_name]
+        # Use the selected collection from session state, fallback to default
+        collection_name_to_clear = st.session_state.mongo_collection_name if 'mongo_collection_name' in st.session_state else mongo_collection_name
+        collection = db[collection_name_to_clear]
         deleted = collection.delete_many({})
-        st.sidebar.success(f"Database geleegd! ({deleted.deleted_count} documenten verwijderd)")
+        st.sidebar.success(f"Database geleegd! ({deleted.deleted_count} documenten verwijderd uit collectie '{collection_name_to_clear}')")
     else:
         st.sidebar.warning("Vink eerst de bevestiging aan voordat je de database leegt.")
 
@@ -107,6 +109,10 @@ if uploaded_file:
     # Image column selector
     image_col = st.selectbox("Selecteer een kolom met afbeeldingen (optioneel)", options=["(geen)"] + list(df.columns), index=0)
 
+    # Identifier column selector
+    identifier_col = st.selectbox("Selecteer een kolom als unieke identifier (bijv. SKU, product ID)", options=["(geen)"] + list(df.columns), index=0)
+    st.session_state.identifier_col = identifier_col
+
     # Field selector
     text_fields = st.multiselect(
         "Select fields to use for search",
@@ -134,12 +140,21 @@ if uploaded_file:
         with open(METADATA_PATH, "r") as f:
             meta = json.load(f)
         if meta.get("cache_hash") == cache_hash and meta.get("backend") == backend:
-            st.session_state.embeddings = np.array([])  # Not used for Mongo
-            st.session_state.index = None
-            st.session_state.model = None
-            st.session_state.built_for = {'df_hash': df_hash, 'fields': fields_hash, 'batch_size': batch_size, 'backend': backend}
-            cache_loaded = True
-            st.success("MongoDB + OpenAI embeddings/index already processed for this data/fields.")
+            # Check MongoDB for documents with this _session
+            try:
+                client = pymongo.MongoClient(mongo_uri)
+                db = client[mongo_db_name]
+                collection = db[mongo_collection_name]
+                doc_count = collection.count_documents({"_session": cache_hash})
+            except Exception as e:
+                doc_count = 0
+            if doc_count > 0:
+                st.session_state.embeddings = np.array([])  # Not used for Mongo
+                st.session_state.index = None
+                st.session_state.model = None
+                st.session_state.built_for = {'df_hash': df_hash, 'fields': fields_hash, 'batch_size': batch_size, 'backend': backend}
+                cache_loaded = True
+                st.success("MongoDB + OpenAI embeddings/index already processed for this data/fields.")
 
     # If new file or new fields or batch size or backend, reset embeddings (but don't auto-build)
     if not cache_loaded and (
@@ -168,108 +183,142 @@ if uploaded_file:
 
         # Build embeddings only when button is pressed
         if build_btn and not st.session_state.building and not cache_loaded:
-            st.toast("Building embeddings, please wait...")
-            st.session_state.building = True
-            st.session_state.embeddings = None
-            st.session_state.index = None
-            st.session_state.model = None
-            with st.spinner("Creating embeddings with OpenAI and uploading to MongoDB..."):
-                openai.api_key = openai_api_key
-                client = pymongo.MongoClient(mongo_uri)
-                db = client[mongo_db_name]
-                collection = db[mongo_collection_name]
-                # Remove all previous docs for this session (optional)
-                collection.delete_many({"_session": cache_hash})
-                docs = [t[:2000] for t in df["combined_text"].tolist()]  # Truncate to 2000 chars for OpenAI
-
-                # Dynamisch batchen op tokenlimiet
-                enc = tiktoken.encoding_for_model(OPENAI_EMBEDDING_MODEL)
-                max_tokens_per_request = 300000
-                batches = []
-                current_batch = []
-                current_tokens = 0
-                for text in docs:
-                    tokens = len(enc.encode(text))
-                    if current_tokens + tokens > max_tokens_per_request and current_batch:
-                        batches.append(current_batch)
-                        current_batch = []
-                        current_tokens = 0
-                    current_batch.append(text)
-                    current_tokens += tokens
-                if current_batch:
-                    batches.append(current_batch)
-
-                max_workers = 4
-                all_embeddings = []
-                st.toast("Starting embedding and upload to MongoDB (parallel batches)...")
-                status_placeholder = st.empty()
-                progress_bar = st.progress(0)
-                total_batches = len(batches)
-
-                def embed_batch(batch):
-                    return openai.embeddings.create(
-                        input=batch,
-                        model=OPENAI_EMBEDDING_MODEL
-                    )
-
-                responses = [None] * len(batches)
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-                done_batches = 0
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    future_to_idx = {executor.submit(embed_batch, batch): idx for idx, batch in enumerate(batches)}
-                    for future in as_completed(future_to_idx):
-                        idx = future_to_idx[future]
-                        try:
-                            response = future.result()
-                            docs_to_upload = []
-                            start_idx = sum(len(b) for b in batches[:idx])
-                            for j, emb in enumerate(response.data):
-                                doc_idx = start_idx + j
-                                doc = {
-                                    "_session": cache_hash,
-                                    "row": doc_idx,
-                                    "text": str(docs[doc_idx])[:2000],
-                                    "embedding": emb.embedding,
-                                }
-                                for col in df.columns:
-                                    val = df.iloc[doc_idx][col]
-                                    if hasattr(val, 'item'):
-                                        try:
-                                            val = val.item()
-                                        except Exception:
-                                            val = str(val)
-                                    else:
-                                        val = str(val)
-                                    if isinstance(val, str):
-                                        val = val[:2000]
-                                    doc[col] = val
-                                if image_col != "(geen)":
-                                    doc["image"] = str(df.iloc[doc_idx][image_col])
-                                docs_to_upload.append(doc)
-                            if docs_to_upload:
-                                collection.insert_many(docs_to_upload)
-                        except Exception as e:
-                            st.error(f"Fout bij batch {idx+1}: {e}")
-                        done_batches += 1
-                        progress = done_batches / total_batches
-                        progress_bar.progress(progress)
-                        status_placeholder.markdown(f"**Batch {done_batches} van {total_batches} (geüpload)**")
-                        st.toast(f"Batch {done_batches} van {total_batches} (geüpload)")
-                progress_bar.empty()
-                status_placeholder.empty()
-
-                st.toast("All embeddings created and uploaded to MongoDB!")
+            # Deduplication: Only embed products not already in the DB by identifier
+            if identifier_col == "(geen)":
+                st.warning("Selecteer een kolom als unieke identifier voordat je embeddings bouwt.")
+            else:
+                st.toast("Building embeddings, please wait...")
+                st.session_state.building = True
+                st.session_state.embeddings = None
                 st.session_state.index = None
                 st.session_state.model = None
-                st.session_state.built_for = {'df_hash': df_hash, 'fields': fields_hash, 'batch_size': batch_size, 'backend': backend}
-                # Save metadata to disk
-                with open(METADATA_PATH, "w") as f:
-                    json.dump({"cache_hash": cache_hash, "backend": backend}, f)
-            st.success("Embeddings created and uploaded to MongoDB! Ready to search. (Metadata saved)")
-            st.session_state.building = False
+                with st.spinner("Creating embeddings with OpenAI and uploading to MongoDB..."):
+                    openai.api_key = openai_api_key
+                    client = pymongo.MongoClient(mongo_uri)
+                    db = client[mongo_db_name]
+                    # Use the selected collection from session state
+                    collection = db[st.session_state.mongo_collection_name] if 'mongo_collection_name' in st.session_state else db[mongo_collection_name]
+                    # Query all existing identifiers
+                    existing_ids = set()
+                    for doc in collection.find({}, {identifier_col: 1}):
+                        val = doc.get(identifier_col)
+                        if val is not None:
+                            existing_ids.add(str(val))
+                    # Only keep rows whose identifier is not in existing_ids
+                    mask = ~df[identifier_col].astype(str).isin(existing_ids)
+                    df_new = df[mask].copy()
+                    if df_new.empty:
+                        st.success("Alle producten in deze CSV zijn al aanwezig in de database. Geen nieuwe producten om te embedden.")
+                        st.session_state.building = False
+                    else:
+                        # Combine selected fields for new products
+                        df_new["combined_text"] = df_new[text_fields].astype(str).agg(" ".join, axis=1)
+                        # Remove all previous docs for this session (optional, or skip for dedup)
+                        # collection.delete_many({"_session": cache_hash})
+                        docs = [str(t)[:2000] for t in df_new["combined_text"].tolist() if isinstance(t, str) and str(t).strip()]
+                        MAX_BATCH_SIZE = 512
+                        MAX_CHAR_LENGTH = 16384  # ~2x max tokens for safety
+                        enc = tiktoken.encoding_for_model(OPENAI_EMBEDDING_MODEL)
+                        max_tokens_per_request = 300000
+                        batches = []
+                        current_batch = []
+                        current_tokens = 0
+                        for text in docs:
+                            if not isinstance(text, str) or not text.strip():
+                                continue  # skip empty or non-string
+                            text = text[:MAX_CHAR_LENGTH]  # truncate overly long strings
+                            tokens = len(enc.encode(text))
+                            if ((current_tokens + tokens > max_tokens_per_request) or (len(current_batch) >= MAX_BATCH_SIZE)) and current_batch:
+                                batches.append(current_batch)
+                                current_batch = []
+                                current_tokens = 0
+                            current_batch.append(text)
+                            current_tokens += tokens
+                        if current_batch:
+                            batches.append(current_batch)
+                        max_workers = 4
+                        all_embeddings = []
+                        st.toast("Starting embedding and upload to MongoDB (parallel batches)...")
+                        status_placeholder = st.empty()
+                        progress_bar = st.progress(0)
+                        total_batches = len(batches)
+                        import time
+                        def embed_batch(batch, batch_idx):
+                            clean_batch = [str(x)[:MAX_CHAR_LENGTH] for x in batch if isinstance(x, str) and str(x).strip()]
+                            if not clean_batch:
+                                raise ValueError(f"Batch {batch_idx} is empty or contains only invalid strings.")
+                            print(f"Embedding batch {batch_idx} of size {len(clean_batch)}. Sample: {clean_batch[:2]}")
+                            retries = 3
+                            while retries > 0:
+                                try:
+                                    return openai.embeddings.create(
+                                        input=clean_batch,
+                                        model=OPENAI_EMBEDDING_MODEL
+                                    )
+                                except Exception as e:
+                                    print(f"Rate limit error on batch {batch_idx}: {e}. Retrying after 12s...")
+                                    time.sleep(12)
+                                    retries -= 1
+                            return None
+                        responses = [None] * len(batches)
+                        from concurrent.futures import ThreadPoolExecutor, as_completed
+                        done_batches = 0
+                        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                            future_to_idx = {executor.submit(embed_batch, batch, idx): idx for idx, batch in enumerate(batches)}
+                            for future in as_completed(future_to_idx):
+                                idx = future_to_idx[future]
+                                try:
+                                    response = future.result()
+                                    if response is None:
+                                        st.error(f"Fout bij batch {idx+1}: batch overgeslagen wegens input error.")
+                                        continue
+                                    docs_to_upload = []
+                                    start_idx = sum(len(b) for b in batches[:idx])
+                                    for j, emb in enumerate(response.data):
+                                        doc_idx = df_new.index[start_idx + j]
+                                        doc = {
+                                            "_session": cache_hash,
+                                            "row": int(doc_idx),
+                                            "text": str(df_new.loc[doc_idx, "combined_text"])[:2000],
+                                            "embedding": emb.embedding,
+                                        }
+                                        for col in df_new.columns:
+                                            val = df_new.loc[doc_idx, col]
+                                            if hasattr(val, 'item'):
+                                                try:
+                                                    val = val.item()
+                                                except Exception:
+                                                    val = str(val)
+                                            else:
+                                                val = str(val)
+                                            if isinstance(val, str):
+                                                val = val[:2000]
+                                            doc[col] = val
+                                        if image_col != "(geen)":
+                                            doc["image"] = str(df_new.loc[doc_idx, image_col])
+                                        docs_to_upload.append(doc)
+                                    if docs_to_upload:
+                                        collection.insert_many(docs_to_upload)
+                                except Exception as e:
+                                    st.error(f"Fout bij batch {idx+1}: {e}")
+                                done_batches += 1
+                                progress = done_batches / total_batches
+                                progress_bar.progress(progress)
+                                status_placeholder.markdown(f"**Batch {done_batches} van {total_batches} (geüpload)**")
+                                st.toast(f"Batch {done_batches} van {total_batches} (geüpload)")
+                        progress_bar.empty()
+                        status_placeholder.empty()
+                        st.toast("All embeddings created and uploaded to MongoDB!")
+                        st.session_state.index = None
+                        st.session_state.model = None
+                        st.session_state.built_for = {'df_hash': df_hash, 'fields': fields_hash, 'batch_size': batch_size, 'backend': backend}
+                        with open(METADATA_PATH, "w") as f:
+                            json.dump({"cache_hash": cache_hash, "backend": backend}, f)
+                    st.success("Embeddings created and uploaded to MongoDB! Ready to search. (Metadata saved)")
+                    st.session_state.building = False
 
 # Ensure MongoDB client is defined for all tabs
-client = pymongo.MongoClient(mongo_uri)
+client = pymongo.MongoClient("mongodb://frank:adfgaSDRSDGsdg5rthdts5ey6dr5rxtdyjftt@116.203.123.107:27017/")
 
 # Sidebar navigation
 sidebar_tabs = [
@@ -349,7 +398,7 @@ elif selected_tab == "Search Products":
             pipeline = [
                 {"$vectorSearch": {
                     "index": "vector_index",
-                    "path": "embedding",
+                    "path": "em.edding",
                     "queryVector": query_vec,
                     "numCandidates": max(100, k*20),
                     "limit": k,
@@ -391,7 +440,7 @@ elif selected_tab == "Search Orders":
 elif selected_tab == "Categorize Products":
     st.header("Categorize Products")
     db = client[mongo_db_name]
-    collection = db[mongo_collection_name]
+    collection = db["documents"]
     cat_collection = db["categories"]
 
     # Editable table for categories
@@ -441,71 +490,117 @@ elif selected_tab == "Categorize Products":
                 st.warning("Geen producten gevonden om te categoriseren. Indexeer eerst een CSV.")
                 st.stop()
 
-            # --- Process products in chunks for performance and memory efficiency ---
-            chunk_size = 500 
-            product_cursor = collection.find({})
+            # --- Parallel processing with streaming updates ---
+            chunk_size = 100  # Smaller chunks for more frequent updates
+            batch_size = 10   # Process multiple chunks in parallel
             
-            all_processed_products = []
-            display_columns = None
+            # Get all product IDs first for better progress tracking
+            product_ids = list(collection.find({}, {"_id": 1}))
+            total_products = len(product_ids)
+            
             progress_bar = st.progress(0)
+            status_placeholder = st.empty()
             table_placeholder = st.empty()
             
-            st.toast(f"Categorizing {total_products} products in chunks of {chunk_size}...")
-
-            product_chunk = []
+            st.toast(f"Categorizing {total_products} products in parallel chunks...")
+            
+            # Process chunks in parallel
+            def process_chunk(chunk_ids):
+                """Process a chunk of products and return results"""
+                chunk_products = list(collection.find({"_id": {"$in": chunk_ids}}))
+                if not chunk_products or "embedding" not in chunk_products[0]:
+                    return []
+                
+                prod_vecs = np.array([p["embedding"] for p in chunk_products], dtype=np.float32)
+                sim = np.dot(prod_vecs, cat_vecs.T)
+                best_cat_idx = np.argmax(sim, axis=1)
+                best_cat_score = np.max(sim, axis=1)
+                
+                # Prepare results and updates
+                results = []
+                update_operations = []
+                
+                for j, p_item in enumerate(chunk_products):
+                    p_item["assigned_category"] = categories[best_cat_idx[j]]
+                    p_item["category_score"] = float(best_cat_score[j])
+                    results.append(p_item)
+                    update_operations.append(
+                        UpdateOne({"_id": p_item["_id"]}, {"$set": {
+                            "assigned_category": p_item["assigned_category"], 
+                            "category_score": p_item["category_score"]
+                        }})
+                    )
+                
+                # Bulk update this chunk
+                if update_operations:
+                    collection.bulk_write(update_operations)
+                
+                return results
+            
+            # Split product IDs into chunks
+            chunks = [product_ids[i:i + chunk_size] for i in range(0, len(product_ids), chunk_size)]
+            chunk_ids = [chunk for chunk in chunks]
+            
+            # Process chunks in parallel with ThreadPoolExecutor
+            all_processed_products = []
+            display_columns = None
             processed_count = 0
             
-            for i, product in enumerate(product_cursor):
-                product_chunk.append(product)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                # Submit all chunks for processing
+                future_to_chunk = {executor.submit(process_chunk, [p["_id"] for p in chunk]): chunk for chunk in chunk_ids}
                 
-                # Process the chunk when it's full or it's the last product
-                if len(product_chunk) == chunk_size or (i + 1) == total_products:
-                    # 1. Vector similarity calculation for the chunk
-                    if "embedding" not in product_chunk[0]:
-                        st.error("Products are missing embeddings. Please re-index the data.")
-                        st.stop()
-                    prod_vecs = np.array([p["embedding"] for p in product_chunk], dtype=np.float32)
-                    sim = np.dot(prod_vecs, cat_vecs.T)
-                    best_cat_idx = np.argmax(sim, axis=1)
-                    best_cat_score = np.max(sim, axis=1)
+                # Process completed chunks as they finish
+                for future in concurrent.futures.as_completed(future_to_chunk):
+                    try:
+                        chunk_results = future.result()
+                        all_processed_products.extend(chunk_results)
+                        processed_count += len(chunk_results)
+                        
+                        # Update progress
+                        progress = processed_count / total_products
+                        progress_bar.progress(progress)
+                        status_placeholder.markdown(f"**Verwerkt:** {processed_count}/{total_products} producten ({progress:.1%})")
+                        
+                        # Update table every few chunks for better performance
+                        if len(all_processed_products) > 0 and (processed_count % (chunk_size * 5) == 0 or processed_count == total_products):
+                            if display_columns is None:
+                                # Determine columns on first run
+                                preferred_order = ["sku", "text", "assigned_category", "category_score"]
+                                all_keys = list(all_processed_products[0].keys())
+                                other_cols = sorted([k for k in all_keys if k not in preferred_order and k not in ["_id", "embedding", "row", "_session"]])
+                                display_columns = [col for col in preferred_order if col in all_keys] + other_cols
+                            
+                            # Show latest results
+                            df_stream = pd.DataFrame(all_processed_products[-500:])  # Show last 500 for performance
+                            if 'category_score' in df_stream.columns:
+                                df_stream['category_score'] = df_stream['category_score'].apply(lambda x: f'{x:.4f}')
+                            table_placeholder.dataframe(df_stream.iloc[::-1][display_columns])
 
-                    # 2. Assign categories and prepare bulk update
-                    update_operations = []
-                    for j, p_item in enumerate(product_chunk):
-                        p_item["assigned_category"] = categories[best_cat_idx[j]]
-                        p_item["category_score"] = float(best_cat_score[j])
-                        update_operations.append(
-                            UpdateOne({"_id": p_item["_id"]}, {"$set": {
-                                "assigned_category": p_item["assigned_category"], 
-                                "category_score": p_item["category_score"]
-                            }})
-                        )
-                    
-                    if update_operations:
-                        collection.bulk_write(update_operations)
-
-                    # 3. Update UI
-                    all_processed_products.extend(product_chunk)
-                    
-                    if display_columns is None:
-                        # Determine columns on first run and set a user-friendly order
-                        preferred_order = ["sku", "text", "assigned_category", "category_score"]
-                        all_keys = list(all_processed_products[0].keys())
-                        other_cols = sorted([k for k in all_keys if k not in preferred_order and k not in ["_id", "embedding", "row", "_session"]])
-                        display_columns = [col for col in preferred_order if col in all_keys] + other_cols
-
-                    df_stream = pd.DataFrame(all_processed_products)
-                    df_stream['category_score'] = df_stream['category_score'].apply(lambda x: f'{x:.4f}')
-                    table_placeholder.dataframe(df_stream.iloc[::-1][display_columns])
-                    
-                    # 4. Reset chunk and update progress
-                    processed_count += len(product_chunk)
-                    product_chunk = []
-                    progress_bar.progress(processed_count / total_products)
-
-            product_cursor.close()
+                    except Exception as e:
+                        st.error(f"Fout bij verwerken van chunk: {e}")
+            
             st.toast("Categorization complete!")
             progress_bar.empty()
+            status_placeholder.empty()
+
+            # --- Add Graphs ---
+            st.subheader("Analyse van de categorisatie")
+            final_df = pd.DataFrame(all_processed_products)
+
+            if not final_df.empty:
+                # 1. Histogram of scores
+                st.write("##### Verdeling van de scores")
+                hist_values = np.histogram(
+                    final_df['category_score'], bins=20, range=(0,1))[0]
+                st.bar_chart(hist_values)
+
+                # 2. Products per category
+                st.write("##### Aantal producten per categorie")
+                category_counts = final_df['assigned_category'].value_counts()
+                st.bar_chart(category_counts)
+            else:
+                st.warning("Geen data beschikbaar voor analyse.")
 
     st.info("Voeg eerst categorieën toe, klik dan op 'Categoriseer producten'. Je kunt het resultaat downloaden als CSV.")
 elif selected_tab == "Dataset Info":
@@ -519,10 +614,17 @@ with st.sidebar.expander("📦 Database Info & Config", expanded=True):
         client.server_info()
         mongo_status = "🟢 Verbonden"
         db = client[mongo_db_name]
-        collection = db[mongo_collection_name]
+        # List all collections in the database
+        collection_names = db.list_collection_names()
+        # Use session state or default
+        if 'mongo_collection_name' not in st.session_state:
+            st.session_state.mongo_collection_name = mongo_collection_name if mongo_collection_name in collection_names else (collection_names[0] if collection_names else "")
+        selected_collection = st.selectbox("Selecteer collectie", options=collection_names, index=collection_names.index(st.session_state.mongo_collection_name) if st.session_state.mongo_collection_name in collection_names else 0)
+        st.session_state.mongo_collection_name = selected_collection
+        collection = db[selected_collection]
         doc_count = collection.count_documents({})
         st.markdown(f"**DB:** `{mongo_db_name}`  ")
-        st.markdown(f"**Collectie:** `{mongo_collection_name}`  ")
+        st.markdown(f"**Collectie:** `{selected_collection}`  ")
         st.markdown(f"**Docs:** `{doc_count}`  ")
     except Exception as e:
         mongo_status = f"🔴 Niet verbonden: {e}"
