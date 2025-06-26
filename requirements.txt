@@ -8,4 +8,5 @@ requests
 pymongo
 openai
 python-dotenv
-tiktoken 
+tiktoken
+plotly 

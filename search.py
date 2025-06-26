@@ -15,8 +15,49 @@ import tiktoken
 import dotenv
 from datetime import datetime
 from pymongo import UpdateOne
+import plotly.express as px
 
 dotenv.load_dotenv()
+
+def display_categorization_results(df):
+    """Displays the categorization results table and graphs."""
+    st.subheader("Analyse van de categorisatie")
+
+    if df.empty or 'category_score' not in df.columns or 'assigned_category' not in df.columns:
+        st.warning("Geen data beschikbaar voor analyse of de data is niet gecategoriseerd.")
+        return
+
+    # --- GRAPHS ---
+    st.write("---")
+
+    # 1. Histogram of scores
+    st.write("##### Verdeling van de scores")
+    counts, bins = np.histogram(df['category_score'], bins=10, range=(0,1))
+    bin_labels = [f'{bins[i]:.1f}-{bins[i+1]:.1f}' for i in range(len(bins)-1)]
+    hist_df = pd.DataFrame({'Score Range': bin_labels, 'Count': counts})
+    st.bar_chart(hist_df.set_index('Score Range'))
+
+    # 2. Products per category
+    st.write("##### Aantal producten per categorie")
+    category_counts = df['assigned_category'].value_counts()
+    st.bar_chart(category_counts)
+
+    # 3. Average score per category
+    st.write("##### Gemiddelde score per categorie")
+    avg_score_per_cat = df.groupby('assigned_category')['category_score'].mean().sort_values(ascending=False)
+    st.bar_chart(avg_score_per_cat)
+
+    # 4. Box plot of scores per category
+    st.write("##### Score verdeling per categorie (Box Plot)")
+    try:
+        fig = px.box(df, x='assigned_category', y='category_score',
+                     color='assigned_category',
+                     title="Score Distributie per Categorie",
+                     labels={"assigned_category": "Categorie", "category_score": "Score"})
+        fig.update_layout(showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.error(f"Kon de box plot niet maken: {e}")
 
 def stqdm(iterable, desc=None):
     from time import sleep
@@ -330,6 +371,33 @@ sidebar_tabs = [
 ]
 selected_tab = st.sidebar.radio("Navigatie", sidebar_tabs, index=0)
 
+# --- SIDEBAR DB INFO ---
+with st.sidebar.expander("📦 Database Info & Config", expanded=True):
+    try:
+        client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=2000)
+        client.server_info()
+        mongo_status = "🟢 Verbonden"
+        db = client[mongo_db_name]
+        # List all collections in the database
+        collection_names = db.list_collection_names()
+        # Use session state or default
+        if 'mongo_collection_name' not in st.session_state:
+            st.session_state.mongo_collection_name = mongo_collection_name if mongo_collection_name in collection_names else (collection_names[0] if collection_names else "")
+        selected_collection = st.selectbox("Selecteer collectie", options=collection_names, index=collection_names.index(st.session_state.mongo_collection_name) if st.session_state.mongo_collection_name in collection_names else 0)
+        st.session_state.mongo_collection_name = selected_collection
+        collection = db[selected_collection]
+        doc_count = collection.count_documents({})
+        st.markdown(f"**DB:** `{mongo_db_name}`  ")
+        st.markdown(f"**Collectie:** `{selected_collection}`  ")
+        st.markdown(f"**Docs:** `{doc_count}`  ")
+    except Exception as e:
+        mongo_status = f"🔴 Niet verbonden: {e}"
+        st.markdown(f"**DB:** `{mongo_db_name}`  ")
+        st.markdown(f"**Collectie:** `{mongo_collection_name}`  ")
+        st.markdown(f"**Docs:** `?`  ")
+    st.markdown(f"**MongoDB status:** {mongo_status}")
+    st.markdown(f"**Model:** `{OPENAI_EMBEDDING_MODEL}`")
+
 # --- MAIN AREA ---
 if selected_tab == "Upload & Index":
     st.header("Upload & Indexeer je CSV")
@@ -440,7 +508,14 @@ elif selected_tab == "Search Orders":
 elif selected_tab == "Categorize Products":
     st.header("Categorize Products")
     db = client[mongo_db_name]
-    collection = db["documents"]
+
+    # Use the currently selected collection for products
+    collection_name = st.session_state.get('mongo_collection_name')
+    collection = None
+    if not collection_name or collection_name == 'categories':
+        st.warning("Selecteer een producten collectie in de sidebar om te categoriseren.")
+    else:
+        collection = db[collection_name]
     cat_collection = db["categories"]
 
     # Editable table for categories
@@ -475,7 +550,10 @@ elif selected_tab == "Categorize Products":
 
     # Categorize products
     st.subheader("Stap 2: Categoriseer producten met AI")
-    if st.button("Categoriseer producten"):
+    if st.button("Categoriseer producten", disabled=(collection is None)):
+        if collection is None:
+             st.error("Selecteer eerst een geldige producten collectie.")
+             st.stop()
         categories_with_embeddings = list(cat_collection.find({}, {"_id": 0, "category": 1, "embedding": 1}))
         if not categories_with_embeddings:
             st.warning("Voeg eerst categorieën toe en sla ze op.")
@@ -572,7 +650,7 @@ elif selected_tab == "Categorize Products":
                                 display_columns = [col for col in preferred_order if col in all_keys] + other_cols
                             
                             # Show latest results
-                            df_stream = pd.DataFrame(all_processed_products[-500:])  # Show last 500 for performance
+                            df_stream = pd.DataFrame(all_processed_products)  # Show all results
                             if 'category_score' in df_stream.columns:
                                 df_stream['category_score'] = df_stream['category_score'].apply(lambda x: f'{x:.4f}')
                             table_placeholder.dataframe(df_stream.iloc[::-1][display_columns])
@@ -584,52 +662,11 @@ elif selected_tab == "Categorize Products":
             progress_bar.empty()
             status_placeholder.empty()
 
-            # --- Add Graphs ---
-            st.subheader("Analyse van de categorisatie")
+            # --- Display new results ---
             final_df = pd.DataFrame(all_processed_products)
-
-            if not final_df.empty:
-                # 1. Histogram of scores
-                st.write("##### Verdeling van de scores")
-                hist_values = np.histogram(
-                    final_df['category_score'], bins=20, range=(0,1))[0]
-                st.bar_chart(hist_values)
-
-                # 2. Products per category
-                st.write("##### Aantal producten per categorie")
-                category_counts = final_df['assigned_category'].value_counts()
-                st.bar_chart(category_counts)
-            else:
-                st.warning("Geen data beschikbaar voor analyse.")
+            display_categorization_results(final_df)
 
     st.info("Voeg eerst categorieën toe, klik dan op 'Categoriseer producten'. Je kunt het resultaat downloaden als CSV.")
 elif selected_tab == "Dataset Info":
     st.header("Dataset Info & Statistieken")
     pass
-
-# --- SIDEBAR DB INFO ---
-with st.sidebar.expander("📦 Database Info & Config", expanded=True):
-    try:
-        client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=2000)
-        client.server_info()
-        mongo_status = "🟢 Verbonden"
-        db = client[mongo_db_name]
-        # List all collections in the database
-        collection_names = db.list_collection_names()
-        # Use session state or default
-        if 'mongo_collection_name' not in st.session_state:
-            st.session_state.mongo_collection_name = mongo_collection_name if mongo_collection_name in collection_names else (collection_names[0] if collection_names else "")
-        selected_collection = st.selectbox("Selecteer collectie", options=collection_names, index=collection_names.index(st.session_state.mongo_collection_name) if st.session_state.mongo_collection_name in collection_names else 0)
-        st.session_state.mongo_collection_name = selected_collection
-        collection = db[selected_collection]
-        doc_count = collection.count_documents({})
-        st.markdown(f"**DB:** `{mongo_db_name}`  ")
-        st.markdown(f"**Collectie:** `{selected_collection}`  ")
-        st.markdown(f"**Docs:** `{doc_count}`  ")
-    except Exception as e:
-        mongo_status = f"🔴 Niet verbonden: {e}"
-        st.markdown(f"**DB:** `{mongo_db_name}`  ")
-        st.markdown(f"**Collectie:** `{mongo_collection_name}`  ")
-        st.markdown(f"**Docs:** `?`  ")
-    st.markdown(f"**MongoDB status:** {mongo_status}")
-    st.markdown(f"**Model:** `{OPENAI_EMBEDDING_MODEL}`")
